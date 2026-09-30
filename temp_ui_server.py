@@ -15,8 +15,8 @@ from cad_router import router
 
 app = FastAPI(
     title="CAD Geometry Extraction - Temporary Testing UI",
-    description="Interactive UI to test DWG, DXF, STL, OBJ extraction microservice.",
-    version="1.0.0"
+    description="Interactive UI to test DWG, DXF, STL, OBJ True-Shape, Curve & Thickness extraction microservice.",
+    version="3.0.0"
 )
 
 # Include the CAD geometry router
@@ -28,7 +28,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CAD Geometry Extractor & Cut-List UI</title>
+  <title>CAD True-Shape & Curve Extractor UI</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -117,7 +117,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     main {
       flex: 1;
-      max-width: 1200px;
+      max-width: 1240px;
       width: 100%;
       margin: 0 auto;
       padding: 2rem 1.5rem;
@@ -141,11 +141,10 @@ HTML_CONTENT = """<!DOCTYPE html>
     .hero-text p {
       color: var(--text-muted);
       font-size: 1rem;
-      max-width: 650px;
+      max-width: 700px;
       margin: 0 auto;
     }
 
-    /* Upload Card */
     .upload-card {
       background: var(--surface);
       border: 1px solid var(--surface-border);
@@ -262,7 +261,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       box-shadow: none;
     }
 
-    /* Status / Loading */
     .status-panel {
       display: none;
       background: var(--surface);
@@ -297,7 +295,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       line-height: 1.5;
     }
 
-    /* Results section */
     .results-container {
       display: none;
       flex-direction: column;
@@ -331,7 +328,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       color: #fff;
     }
 
-    /* Table styling */
     .table-card {
       background: var(--surface);
       border: 1px solid var(--surface-border);
@@ -365,12 +361,12 @@ HTML_CONTENT = """<!DOCTYPE html>
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.05em;
-      padding: 0.85rem 1.5rem;
+      padding: 0.85rem 1.25rem;
       border-bottom: 1px solid var(--surface-border);
     }
 
     td {
-      padding: 1rem 1.5rem;
+      padding: 1rem 1.25rem;
       font-size: 0.9rem;
       border-bottom: 1px solid rgba(255, 255, 255, 0.04);
     }
@@ -396,6 +392,30 @@ HTML_CONTENT = """<!DOCTYPE html>
       font-weight: 600;
     }
 
+    .thick-tag {
+      display: inline-flex;
+      align-items: center;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      background: rgba(245, 158, 11, 0.15);
+      color: #fbbf24;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+
+    .radius-tag {
+      display: inline-flex;
+      align-items: center;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      background: rgba(168, 85, 247, 0.15);
+      color: #c084fc;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+
     .qty-tag {
       font-weight: 700;
       color: var(--accent);
@@ -405,7 +425,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       font-size: 0.85rem;
     }
 
-    /* JSON Box */
     .json-card {
       background: var(--surface);
       border: 1px solid var(--surface-border);
@@ -439,7 +458,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       background: rgba(255, 255, 255, 0.18);
     }
 
-    /* 2D Preview Section */
     .preview-canvas-card {
       background: var(--surface);
       border: 1px solid var(--surface-border);
@@ -456,18 +474,34 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     .preview-board {
       width: 100%;
-      height: 240px;
+      min-height: 260px;
       background: #070b14;
       border: 1px solid #1f293d;
       border-radius: 8px;
       position: relative;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       justify-content: center;
+      padding: 1rem;
+      gap: 1.25rem;
       overflow: hidden;
       background-image: linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
                         linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
       background-size: 20px 20px;
+    }
+
+    .svg-wrapper {
+      width: 200px;
+      height: 160px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .svg-wrapper svg {
+      width: 100%;
+      height: 100%;
     }
   </style>
 </head>
@@ -477,16 +511,16 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="brand">
       <div class="brand-icon">📐</div>
       <div>
-        <div class="brand-title">CAD Geometry Extraction</div>
+        <div class="brand-title">CAD True-Shape & Curve Extraction</div>
       </div>
     </div>
-    <span class="badge-temp">Temporary Test Mode</span>
+    <span class="badge-temp">True-Shape & Curve Engine v3.0</span>
   </header>
 
   <main>
     <div class="hero-text">
-      <h1>Extract 2D Part Cut-Lists</h1>
-      <p>Upload any CAD drawing or 3D model (.dwg, .dxf, .stl, .obj) to flatten geometry, extract width & length, and merge quantities for 2D nesting.</p>
+      <h1>Extract All Surface Angles, Curves & Thickness</h1>
+      <p>Scan all surface angles across 3D models, measure material thickness, reconstruct curved radii (cylinders, holes, fillets), and output labeled SVG profiles.</p>
     </div>
 
     <!-- Upload Box -->
@@ -509,7 +543,7 @@ HTML_CONTENT = """<!DOCTYPE html>
           <span style="color: var(--text-muted);">No file selected yet</span>
         </div>
         <button id="extractBtn" class="btn" disabled>
-          <span>Extract Cut-List</span>
+          <span>Extract All Profiles & Curves</span>
           <span>⚡</span>
         </button>
       </div>
@@ -519,8 +553,8 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="status-panel" id="statusPanel">
       <div class="spinner"></div>
       <div>
-        <div style="font-weight: 600; font-size: 0.95rem;" id="statusText">Processing CAD geometry...</div>
-        <div style="color: var(--text-muted); font-size: 0.8rem;">Converting DWG via ODA File Converter and computing bounding boxes</div>
+        <div style="font-weight: 600; font-size: 0.95rem;" id="statusText">Scanning all surface angles & measuring curves...</div>
+        <div style="color: var(--text-muted); font-size: 0.8rem;">Relaxing normal tolerances, measuring thickness, fitting curved radii, and rendering SVG profiles</div>
       </div>
     </div>
 
@@ -529,10 +563,9 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     <!-- Results Display -->
     <div class="results-container" id="resultsContainer">
-      <!-- Metric Cards -->
       <div class="stats-grid">
         <div class="stat-card">
-          <div class="stat-label">Unique Dimension Groups</div>
+          <div class="stat-label">Extracted Profiles & Curves</div>
           <div class="stat-value" id="statGroups">0</div>
         </div>
         <div class="stat-card">
@@ -545,9 +578,9 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- 2D Visual Preview -->
+      <!-- 2D True-Shape SVG Preview -->
       <div class="preview-canvas-card">
-        <h3>2D Bounding Box Visualizer</h3>
+        <h3>2D True-Shape SVG Vector Visualizer (With Thickness & Curve Labels)</h3>
         <div class="preview-board" id="previewBoard">
           <span style="color: var(--text-muted); font-size: 0.85rem;">Interactive preview loaded below</span>
         </div>
@@ -556,13 +589,16 @@ HTML_CONTENT = """<!DOCTYPE html>
       <!-- Parts Table -->
       <div class="table-card">
         <div class="card-header">
-          <h2>Extracted Part Cut-List (For 2D Nesting)</h2>
+          <h2>Extracted Profile & Curve Cut-List</h2>
         </div>
         <table>
           <thead>
             <tr>
               <th>Part Name / ID</th>
-              <th>Dimensions (W × L)</th>
+              <th>Thickness (Z-axis)</th>
+              <th>Radius (Curved)</th>
+              <th>Bounding Box (W × L)</th>
+              <th>Holes / Cutouts</th>
               <th>Quantity</th>
               <th>Rotation Allowed</th>
             </tr>
@@ -688,26 +724,37 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById('statTotalQty').textContent = totalQty;
       document.getElementById('statFilename').textContent = currentFile.name;
 
-      // Table rows
       partsTableBody.innerHTML = '';
       if (parts.length === 0) {
         partsTableBody.innerHTML = `
           <tr>
-            <td colspan="4" style="text-align: center; color: var(--text-muted); padding: 2rem;">
-              No 2D parts extracted from this file. (If this is a 3D solid model, ensure it contains surface boundaries or use STL/OBJ).
+            <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">
+              No shapes extracted from this file.
             </td>
           </tr>
         `;
       } else {
         parts.forEach(p => {
           const tr = document.createElement('tr');
+          const bbox = p.bounding_box || p.dimensions || {};
+          const holes = p.holes || [];
+          const radStr = p.radius !== null && p.radius !== undefined ? `<span class="radius-tag">R: ${p.radius}</span>` : '<span style="color: var(--text-muted);">-</span>';
           tr.innerHTML = `
             <td>
               <div style="font-weight: 600;">${p.name || p.part_id}</div>
               <div style="font-size: 0.75rem; color: var(--text-muted); font-family: monospace;">${p.part_id}</div>
             </td>
             <td>
-              <span class="dim-tag">${p.dimensions.width} × ${p.dimensions.length}</span>
+              <span class="thick-tag">T: ${p.thickness}</span>
+            </td>
+            <td>
+              ${radStr}
+            </td>
+            <td>
+              <span class="dim-tag">${bbox.width} × ${bbox.length}</span>
+            </td>
+            <td>
+              <span style="font-family: monospace; color: #9ca3af;">${holes.length} hole(s)</span>
             </td>
             <td>
               <span class="qty-tag">${p.quantity}</span>
@@ -722,41 +769,50 @@ HTML_CONTENT = """<!DOCTYPE html>
         });
       }
 
-      // 2D Preview Boxes
+      // Render SVG previews
       previewBoard.innerHTML = '';
       if (parts.length > 0) {
-        const maxDim = Math.max(...parts.flatMap(p => [p.dimensions.width, p.dimensions.length]));
-        const scale = maxDim > 0 ? (160 / maxDim) : 1;
-
-        parts.forEach((p, idx) => {
-          const w = Math.max(16, p.dimensions.width * scale);
-          const h = Math.max(16, p.dimensions.length * scale);
-          
-          const box = document.createElement('div');
-          box.style.cssText = `
-            width: ${w}px;
-            height: ${h}px;
-            border: 2px solid #3b82f6;
-            background: rgba(59, 130, 246, 0.15);
-            border-radius: 4px;
-            display: inline-flex;
+        parts.forEach(p => {
+          const container = document.createElement('div');
+          container.style.cssText = `
+            display: flex;
+            flex-direction: column;
             align-items: center;
-            justify-content: center;
-            margin: 10px;
-            color: #93c5fd;
-            font-size: 0.75rem;
-            font-weight: 600;
-            font-family: monospace;
-            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+            background: rgba(24, 34, 52, 0.75);
+            border: 1px solid var(--surface-border);
+            border-radius: 10px;
+            padding: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
           `;
-          box.textContent = `${p.dimensions.width}×${p.dimensions.length}`;
-          previewBoard.appendChild(box);
+
+          const svgWrapper = document.createElement('div');
+          svgWrapper.className = 'svg-wrapper';
+          if (p.svg_path) {
+            svgWrapper.innerHTML = p.svg_path;
+          } else {
+            svgWrapper.innerHTML = '<span style="color: var(--text-muted);">No SVG</span>';
+          }
+
+          container.appendChild(svgWrapper);
+
+          const label = document.createElement('div');
+          label.style.cssText = `
+            font-size: 0.75rem;
+            font-family: monospace;
+            color: #93c5fd;
+            margin-top: 8px;
+            font-weight: 600;
+          `;
+          const bbox = p.bounding_box || p.dimensions || {};
+          label.textContent = `${bbox.width}×${bbox.length} (T: ${p.thickness})`;
+          container.appendChild(label);
+
+          previewBoard.appendChild(container);
         });
       } else {
         previewBoard.innerHTML = '<span style="color: var(--text-muted); font-size: 0.85rem;">No 2D parts to preview</span>';
       }
 
-      // JSON viewer
       jsonCode.textContent = JSON.stringify(parts, null, 2);
     }
 

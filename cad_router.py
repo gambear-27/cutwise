@@ -4,18 +4,17 @@ import uuid
 import tempfile
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 
 # ==============================================================================
 # Python Import Resolution
-# Ensure current directory, parent directory, and project root are in sys.path
-# so that schemas.py can be imported without ModuleNotFoundError regardless of how
-# this file is executed (directly or as part of a package).
+# Ensure current directory and parent directory are in sys.path so schemas.py
+# can be imported without ModuleNotFoundError regardless of execution context.
 # ==============================================================================
 _current_file = Path(__file__).resolve()
 _search_dirs = [
     _current_file.parent,          # Directory containing cad_router.py
-    _current_file.parent.parent,   # Parent directory (e.g. project root when inside a subfolder)
+    _current_file.parent.parent,   # Parent directory
 ]
 
 for _dir in _search_dirs:
@@ -26,18 +25,20 @@ for _dir in _search_dirs:
 import numpy as np
 import trimesh
 import ezdxf
+import ezdxf.path
 import ezdxf.bbox
+from shapely.geometry import Polygon, LineString, MultiPolygon
+from shapely.ops import polygonize, unary_union
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
-from schemas import PartDimension, PartItem
+from schemas import BoundingBox, PartDimension, PartItem
 
 # Router instance with prefix /cad
-router = APIRouter(prefix="/cad", tags=["CAD Dimension Extraction"])
+router = APIRouter(prefix="/cad", tags=["CAD True-Shape Extraction"])
 
 # ==============================================================================
 # ODA File Converter Configuration
-# Clear placeholder variable: update this with your local ODA File Converter path / version.
-# Automatically detects installed version if present, or defaults to the standard path.
+# Automatically detects installed ODA File Converter version or defaults to standard path.
 # ==============================================================================
 _DEFAULT_ODA_PATH = (
     r"C:\Program Files\ODA\ODAFileConverter 27.9.0\ODAFileConverter.exe"
@@ -54,14 +55,6 @@ ODA_CONVERTER_PATH = os.getenv(
 def convert_dwg_to_dxf(dwg_path: Path, output_dir: Path) -> Path:
     """
     Converts a DWG file to DXF format by calling the ODA File Converter CLI.
-    Robustly handles file paths with spaces, captures process errors, and runs headless.
-
-    Args:
-        dwg_path: Path to the input .dwg file.
-        output_dir: Directory where the converted .dxf file will be saved.
-
-    Returns:
-        Path to the converted .dxf file.
     """
     converter_path = Path(ODA_CONVERTER_PATH)
     if not converter_path.is_file():
@@ -79,9 +72,6 @@ def convert_dwg_to_dxf(dwg_path: Path, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     input_dir = dwg_path.parent.resolve()
 
-    # ODA File Converter CLI syntax:
-    # ODAFileConverter <Input Dir> <Output Dir> <Output Version> <Output Type> <Recurse> <Audit> [Filter]
-    # Note: subprocess.run automatically quotes arguments containing spaces on Windows when passed as a list.
     cmd = [
         str(converter_path),
         str(input_dir),
@@ -93,7 +83,6 @@ def convert_dwg_to_dxf(dwg_path: Path, output_dir: Path) -> Path:
         dwg_path.name    # Input file filter
     ]
 
-    # Suppress console / GUI window popup on Windows
     creation_flags = 0
     if sys.platform == "win32":
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -122,12 +111,10 @@ def convert_dwg_to_dxf(dwg_path: Path, output_dir: Path) -> Path:
             f"ODA File Converter failed with exit code {result.returncode}: {error_msg}"
         )
 
-    # Locate the expected DXF output file
     expected_dxf = output_dir / f"{dwg_path.stem}.dxf"
     if expected_dxf.is_file():
         return expected_dxf
 
-    # Case-insensitive / glob fallback search in the output directory
     dxf_matches = [f for f in output_dir.iterdir() if f.is_file() and f.suffix.lower() == ".dxf"]
     for match in dxf_matches:
         if match.stem.lower() == dwg_path.stem.lower():
@@ -142,12 +129,168 @@ def convert_dwg_to_dxf(dwg_path: Path, output_dir: Path) -> Path:
     )
 
 
-def extract_3d_dimensions(file_path: Path, file_stem: str) -> List[PartItem]:
+def generate_svg_with_labels(
+    contour: List[List[float]],
+    holes: Optional[List[List[List[float]]]] = None,
+    thickness: float = 0.0,
+    radius: Optional[float] = None
+) -> str:
     """
-    Extracts flat 2D bounding box dimensions from a 3D CAD file (STL, OBJ).
-    Loads the file as a scene, splits geometries into disconnected bodies,
-    computes oriented bounding box extents, assumes the smallest dimension is
-    material thickness, and maps the two largest dimensions to 2D width and length.
+    Generates a clean vector SVG string representation of a 2D contour including:
+    - Outer boundary path
+    - Inner hole cutouts (using evenodd fill-rule)
+    - Embedded text label displaying calculated Material Thickness and Curve Radius.
+    """
+    if not contour:
+        return ""
+
+    holes = holes or []
+    xs = [pt[0] for pt in contour]
+    ys = [pt[1] for pt in contour]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    w = max(1.0, max_x - min_x)
+    h = max(1.0, max_y - min_y)
+    pad = max(w, h) * 0.12
+
+    view_min_x = min_x - pad
+    view_min_y = min_y - pad
+    view_w = w + 2 * pad
+    view_h = h + 2 * pad
+
+    # Outer path string
+    path_d = f"M {contour[0][0]} {contour[0][1]} " + " ".join(f"L {pt[0]} {pt[1]}" for pt in contour[1:]) + " Z"
+
+    # Inner holes paths
+    for hole in holes:
+        if len(hole) >= 3:
+            path_d += f" M {hole[0][0]} {hole[0][1]} " + " ".join(f"L {pt[0]} {pt[1]}" for pt in hole[1:]) + " Z"
+
+    label_parts = [f"T: {thickness:.2f}"]
+    if radius is not None and radius > 0:
+        label_parts.append(f"R: {radius:.2f}")
+    label_text = " | ".join(label_parts)
+
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    font_size = max(1.0, max(w, h) * 0.05)
+    stroke_w = max(0.5, max(w, h) / 80.0)
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{view_min_x:.2f} {view_min_y:.2f} {view_w:.2f} {view_h:.2f}">'
+        f'<path d="{path_d}" fill="rgba(59, 130, 246, 0.22)" stroke="#3b82f6" stroke-width="{stroke_w:.2f}" fill-rule="evenodd"/>'
+        f'<text x="{center_x:.2f}" y="{center_y:.2f}" font-family="sans-serif" font-size="{font_size:.2f}" font-weight="bold" fill="#fbbf24" text-anchor="middle" dominant-baseline="middle">{label_text}</text>'
+        f'</svg>'
+    )
+    return svg
+
+
+def group_surface_normals(normals: np.ndarray, atol: float = 1e-2) -> List[Dict[str, Any]]:
+    """
+    Groups surface normal vectors across ALL angles with relaxed floating-point tolerance (atol=1e-2)
+    so coplanar triangles with minor STL export rounding errors are correctly grouped together.
+    """
+    clusters: List[Dict[str, Any]] = []
+
+    for i, n in enumerate(normals):
+        norm = np.linalg.norm(n)
+        if norm < 1e-6:
+            continue
+        n_unit = n / norm
+
+        found = False
+        for c in clusters:
+            # Unorient vector check: coplanar parallel faces (+N and -N) share orientation plane
+            if abs(np.dot(n_unit, c["normal"])) >= (1.0 - atol):
+                c["indices"].append(i)
+                found = True
+                break
+
+        if not found:
+            clusters.append({"normal": n_unit, "indices": [i]})
+
+    return clusters
+
+
+def detect_curved_features(body: trimesh.Trimesh, atol: float = 1e-2) -> List[Dict[str, Any]]:
+    """
+    Recognizes and measures curved geometries (cylinders, fillets, circular holes, pins)
+    approximated by flat triangular facets in STL files.
+    Groups facets, fits 2D circles, calculates radii, center coordinates, and extrusion depth.
+    """
+    features: List[Dict[str, Any]] = []
+    normals = body.face_normals
+    if len(normals) < 6:
+        return features
+
+    # Check candidate curve axes (principal axes X, Y, Z or PCA axes)
+    candidate_axes = [
+        np.array([1.0, 0.0, 0.0]),
+        np.array([0.0, 1.0, 0.0]),
+        np.array([0.0, 0.0, 1.0]),
+    ]
+
+    for axis in candidate_axes:
+        axis_unit = axis / np.linalg.norm(axis)
+        dots = np.abs(np.dot(normals, axis_unit))
+
+        # Curved facets are orthogonal to curve axis (dot product near 0)
+        side_mask = dots < (10.0 * atol)
+        if np.sum(side_mask) >= 6:
+            side_faces = body.faces[side_mask]
+            vertex_indices = np.unique(side_faces)
+
+            # Align axis to Z
+            rot_matrix = trimesh.geometry.align_vectors(axis_unit, np.array([0.0, 0.0, 1.0]))
+            aligned = body.copy().apply_transform(rot_matrix)
+
+            pts2d = aligned.vertices[vertex_indices][:, :2]
+            z_coords = aligned.vertices[vertex_indices][:, 2]
+            depth = float(z_coords.max() - z_coords.min())
+
+            if len(pts2d) < 6 or depth <= 0:
+                continue
+
+            # Fit 2D circle using least squares: (x - xc)^2 + (y - yc)^2 = R^2
+            x = pts2d[:, 0]
+            y = pts2d[:, 1]
+            A_mat = np.column_stack([x, y, np.ones_like(x)])
+            b_vec = x**2 + y**2
+
+            try:
+                c_sol, res, rank, s = np.linalg.lstsq(A_mat, b_vec, rcond=None)
+                xc = float(c_sol[0] / 2.0)
+                yc = float(c_sol[1] / 2.0)
+                r = float(np.sqrt(max(0, c_sol[2] + xc**2 + yc**2)))
+
+                dists = np.sqrt((x - xc)**2 + (y - yc)**2)
+                rel_err = float(np.std(dists) / r) if r > 0 else 1.0
+
+                # If relative radial standard deviation < 5%, it's a verified true curve
+                if rel_err < 0.05 and r > 1e-3:
+                    features.append({
+                        "axis": axis_unit,
+                        "radius": round(r, 4),
+                        "depth": round(depth, 4),
+                        "center": (round(xc, 4), round(yc, 4)),
+                        "rot_matrix": rot_matrix,
+                    })
+            except Exception:
+                continue
+
+    return features
+
+
+def extract_3d_true_shapes(file_path: Path, file_stem: str) -> List[PartItem]:
+    """
+    Upgraded 3D Pipeline (STL, OBJ via trimesh):
+    - Processes ALL unique surface normal angles across 3D geometry.
+    - Relaxes floating-point tolerances (atol=1e-2).
+    - Removes minimum area thresholds (preserves thin lips, micro-cutouts, small features).
+    - Merges adjacent coplanar triangles into continuous 2D polygon outlines (outer boundaries + inner holes).
+    - Recognizes and measures curved geometries (cylinders, holes, fillets), calculating radii and depth.
+    - Outputs material thickness and embeds text labels in final SVG string output.
     """
     try:
         loaded = trimesh.load(str(file_path), force="scene")
@@ -160,10 +303,8 @@ def extract_3d_dimensions(file_path: Path, file_stem: str) -> List[PartItem]:
     parts: List[PartItem] = []
     body_counter = 0
 
-    # Collect all Trimesh geometries from the scene or loaded object
     if isinstance(loaded, trimesh.Scene):
         try:
-            # dump() flattens graph nodes and applies world transformations
             geometries = [g for g in loaded.dump(concatenate=False) if isinstance(g, trimesh.Trimesh)]
         except Exception:
             geometries = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
@@ -173,7 +314,6 @@ def extract_3d_dimensions(file_path: Path, file_stem: str) -> List[PartItem]:
         geometries = []
 
     for geom in geometries:
-        # Split geometry into disconnected bodies
         try:
             bodies = geom.split(only_watertight=False)
             if not isinstance(bodies, list):
@@ -185,49 +325,148 @@ def extract_3d_dimensions(file_path: Path, file_stem: str) -> List[PartItem]:
             if body.is_empty or len(body.vertices) == 0:
                 continue
 
-            try:
-                obb = body.bounding_box_oriented
-                extents = np.asarray(obb.extents, dtype=float)
-                if extents.shape[0] != 3:
-                    continue
+            body_counter += 1
 
-                # Sort the 3 resulting dimensions:
-                # Smallest is material thickness; two largest map to width and length
-                sorted_dims = np.sort(extents)
-                thickness = float(sorted_dims[0])
-                width = round(float(sorted_dims[1]), 4)
-                length = round(float(sorted_dims[2]), 4)
+            # 1. Curve & Cylinder Recognition
+            curved_feats = detect_curved_features(body)
+            processed_curve_axes = set()
 
-                if width <= 0 or length <= 0:
-                    continue
+            for feat in curved_feats:
+                r = feat["radius"]
+                depth = feat["depth"]
+                xc, yc = feat["center"]
 
-                body_counter += 1
+                # Generate 2D circle contour representation
+                angles = np.linspace(0, 2 * np.pi, 64, endpoint=True)
+                contour = [[round(xc + r * np.cos(a), 4), round(yc + r * np.sin(a), 4)] for a in angles]
+                if contour[0] != contour[-1]:
+                    contour.append(contour[0])
+
+                xs = [pt[0] for pt in contour]
+                ys = [pt[1] for pt in contour]
+                w = round(max(xs) - min(xs), 4)
+                l = round(max(ys) - min(ys), 4)
+
+                part_id = f"{file_stem}_curve_r{int(r*100)}_{uuid.uuid4().hex[:6]}"
+                part_name = f"{file_stem}_curved_feature_r{r}"
+
+                svg = generate_svg_with_labels(contour, holes=[], thickness=depth, radius=r)
+
                 parts.append(
                     PartItem(
-                        part_id=f"{file_stem}_body_{body_counter}_{uuid.uuid4().hex[:6]}",
-                        name=f"{file_stem}_body_{body_counter}",
-                        dimensions=PartDimension(width=width, length=length),
+                        part_id=part_id,
+                        name=part_name,
+                        thickness=depth,
+                        radius=r,
+                        contour=contour,
+                        holes=[],
+                        bounding_box=BoundingBox(width=w, length=l),
+                        svg_path=svg,
                         quantity=1,
                         allow_rotation=True,
                     )
                 )
-            except Exception:
-                continue
+
+            # 2. Process ALL Unique Surface Normal Angles across 3D geometry
+            normal_clusters = group_surface_normals(body.face_normals, atol=1e-2)
+
+            for cluster_idx, cluster in enumerate(normal_clusters):
+                primary_normal = cluster["normal"]
+                face_indices = cluster["indices"]
+
+                # Align body to Z-axis for this normal angle
+                rot_matrix = trimesh.geometry.align_vectors(primary_normal, np.array([0.0, 0.0, 1.0]))
+                aligned = body.copy().apply_transform(rot_matrix)
+
+                # Material thickness along surface normal (perpendicular distance to opposite parallel face / depth)
+                z_coords = aligned.vertices[:, 2]
+                thickness = round(float(z_coords.max() - z_coords.min()), 4)
+
+                v2d = aligned.vertices[:, :2]
+                cluster_faces = body.faces[face_indices]
+
+                triangles = []
+                # NO MINIMUM AREA THRESHOLDS: Preserve all geometric shapes, thin lips, and cutouts
+                for f in cluster_faces:
+                    pts = v2d[f]
+                    poly = Polygon(pts)
+                    if poly.is_valid and poly.area > 0:
+                        triangles.append(poly)
+
+                if not triangles:
+                    continue
+
+                # Merge adjacent coplanar triangles into continuous 2D polygon outlines
+                union_poly = unary_union(triangles)
+                if union_poly.is_empty:
+                    continue
+
+                polygons = union_poly.geoms if hasattr(union_poly, "geoms") else [union_poly]
+
+                for shape_idx, polygon in enumerate(polygons):
+                    if polygon.is_empty or polygon.area <= 0:
+                        continue
+
+                    # Outer boundary
+                    raw_exterior = list(polygon.exterior.coords)
+                    contour = [[round(float(x), 4), round(float(y), 4)] for x, y in raw_exterior]
+                    if len(contour) > 0 and contour[0] != contour[-1]:
+                        contour.append(contour[0])
+
+                    if len(contour) < 3:
+                        continue
+
+                    # Inner holes
+                    holes = []
+                    for interior in polygon.interiors:
+                        raw_hole = list(interior.coords)
+                        hole_pts = [[round(float(x), 4), round(float(y), 4)] for x, y in raw_hole]
+                        if len(hole_pts) >= 3:
+                            if hole_pts[0] != hole_pts[-1]:
+                                hole_pts.append(hole_pts[0])
+                            holes.append(hole_pts)
+
+                    minx, miny, maxx, maxy = polygon.bounds
+                    width = round(float(maxx - minx), 4)
+                    length = round(float(maxy - miny), 4)
+
+                    if width <= 0 or length <= 0:
+                        continue
+
+                    part_id = f"{file_stem}_body_{body_counter}_face_{cluster_idx}_{shape_idx}_{uuid.uuid4().hex[:5]}"
+                    part_name = f"{file_stem}_face_angle_{cluster_idx+1}"
+
+                    svg = generate_svg_with_labels(contour, holes=holes, thickness=thickness, radius=None)
+
+                    parts.append(
+                        PartItem(
+                            part_id=part_id,
+                            name=part_name,
+                            thickness=thickness,
+                            radius=None,
+                            contour=contour,
+                            holes=holes,
+                            bounding_box=BoundingBox(width=width, length=length),
+                            svg_path=svg,
+                            quantity=1,
+                            allow_rotation=True,
+                        )
+                    )
 
     return parts
 
 
-def extract_dxf_dimensions(
+def extract_dxf_true_shapes(
     dxf_path: Path,
     file_stem: str,
-    skip_insert: bool = False
+    default_thickness: float = 0.0
 ) -> List[PartItem]:
     """
-    Extracts flat 2D bounding box dimensions from a DXF file using ezdxf.
-    Strictly uses ezdxf.bbox.extents([entity]) wrapped in try/except to prevent
-    crashes with 3D INSERT blocks and unsupported entities.
-    Optionally skips INSERT entities if specified.
-    Ignores entities with width or length equal to 0.
+    Upgraded 2D Pipeline (DWG, DXF via ezdxf):
+    - Removes minimum area thresholds.
+    - Reads lines, arcs, splines, polylines, circles, ellipses, hatches, and block references (INSERT).
+    - Stitches entities into closed 2D loops with outer boundaries and inner holes.
+    - Includes default thickness and generates SVG output with text labels.
     """
     try:
         doc = ezdxf.readfile(str(dxf_path))
@@ -238,43 +477,93 @@ def extract_dxf_dimensions(
         )
 
     msp = doc.modelspace()
-    parts: List[PartItem] = []
+    lines: List[LineString] = []
+    closed_polys: List[Polygon] = []
 
-    for idx, entity in enumerate(msp):
-        entity_type = entity.dxftype()
+    def process_entity_collection(entities):
+        for entity in entities:
+            entity_type = entity.dxftype()
 
-        # Optionally skip INSERT entities
-        if skip_insert and entity_type == "INSERT":
-            continue
-
-        # STRICT REQUIREMENT: strictly MUST use ezdxf.bbox.extents([entity]) wrapped in try/except
-        try:
-            box = ezdxf.bbox.extents([entity])
-            if box is None or not box.has_data:
+            if entity_type == "INSERT":
+                try:
+                    process_entity_collection(entity.virtual_entities())
+                except Exception:
+                    pass
                 continue
-            width = abs(float(box.extmax.x - box.extmin.x))
-            length = abs(float(box.extmax.y - box.extmin.y))
-        except Exception:
-            # Skip any entity that fails bounding box calculation (e.g. 3D solid blocks)
+
+            try:
+                path = ezdxf.path.make_path(entity)
+                coords = [(round(float(pt.x), 4), round(float(pt.y), 4)) for pt in path.flattening(distance=0.01)]
+                if len(coords) < 2:
+                    continue
+
+                if path.is_closed:
+                    poly = Polygon(coords)
+                    if poly.is_valid and poly.area > 0:
+                        closed_polys.append(poly)
+                    elif len(coords) >= 3:
+                        lines.append(LineString(coords))
+                else:
+                    lines.append(LineString(coords))
+            except Exception:
+                pass
+
+    process_entity_collection(msp)
+
+    # Stitch open entities into 2D polygons using polygonize
+    stitched_polys = list(polygonize(lines))
+    all_polys = closed_polys + stitched_polys
+
+    parts: List[PartItem] = []
+    part_counter = 0
+
+    for poly in all_polys:
+        if poly.is_empty or poly.area <= 0:
             continue
 
-        # Ignore any entity where width or length equals 0
-        if width == 0 or length == 0:
+        part_counter += 1
+
+        # Outer contour
+        raw_coords = list(poly.exterior.coords)
+        contour = [[round(float(x), 4), round(float(y), 4)] for x, y in raw_coords]
+        if len(contour) > 0 and contour[0] != contour[-1]:
+            contour.append(contour[0])
+
+        if len(contour) < 3:
             continue
 
-        width_rounded = round(width, 4)
-        length_rounded = round(length, 4)
-        if width_rounded == 0 or length_rounded == 0:
+        # Inner holes
+        holes = []
+        for interior in poly.interiors:
+            raw_hole = list(interior.coords)
+            hole_pts = [[round(float(x), 4), round(float(y), 4)] for x, y in raw_hole]
+            if len(hole_pts) >= 3:
+                if hole_pts[0] != hole_pts[-1]:
+                    hole_pts.append(hole_pts[0])
+                holes.append(hole_pts)
+
+        minx, miny, maxx, maxy = poly.bounds
+        width = round(float(maxx - minx), 4)
+        length = round(float(maxy - miny), 4)
+
+        if width <= 0 or length <= 0:
             continue
 
-        part_id = f"{file_stem}_{entity_type}_{idx}_{uuid.uuid4().hex[:6]}"
-        part_name = f"{file_stem}_{entity_type}_{idx}"
+        part_id = f"{file_stem}_shape_{part_counter}_{uuid.uuid4().hex[:6]}"
+        part_name = f"{file_stem}_shape_{part_counter}"
+
+        svg = generate_svg_with_labels(contour, holes=holes, thickness=default_thickness, radius=None)
 
         parts.append(
             PartItem(
                 part_id=part_id,
                 name=part_name,
-                dimensions=PartDimension(width=width_rounded, length=length_rounded),
+                thickness=default_thickness,
+                radius=None,
+                contour=contour,
+                holes=holes,
+                bounding_box=BoundingBox(width=width, length=length),
+                svg_path=svg,
                 quantity=1,
                 allow_rotation=True,
             )
@@ -283,24 +572,34 @@ def extract_dxf_dimensions(
     return parts
 
 
-def group_parts_by_dimensions(parts: List[PartItem]) -> List[PartItem]:
+def group_true_shape_parts(parts: List[PartItem]) -> List[PartItem]:
     """
-    Groups parts with identical width and length dimensions.
-    Merges them into a single PartItem and increments the quantity
-    to compress the JSON payload for downstream nesting algorithms.
-    When allow_rotation is True, orientation is normalized (min_dim, max_dim)
-    so identically sized parts rotated by 90 degrees merge accurately.
+    Groups identical true-shapes to optimize payload quantity for downstream
+    True-Shape Bin Packing algorithms.
+    Computes geometric signature (thickness, radius, 2D area, 2D perimeter, bounding box)
+    and merges identical shapes into a single PartItem with incremented quantity.
     """
-    grouped: dict[tuple[float, float], PartItem] = {}
+    grouped: dict[tuple, PartItem] = {}
 
     for part in parts:
-        w = round(part.dimensions.width, 4)
-        l = round(part.dimensions.length, 4)
+        try:
+            poly = Polygon(part.contour)
+            area = round(float(poly.area), 4)
+            perimeter = round(float(poly.length), 4)
+        except Exception:
+            area = 0.0
+            perimeter = 0.0
+
+        t = round(float(part.thickness), 4)
+        r = round(float(part.radius), 4) if part.radius is not None else None
+        w = round(float(part.bounding_box.width), 4)
+        l = round(float(part.bounding_box.length), 4)
+        num_holes = len(part.holes)
 
         if part.allow_rotation:
-            key = (min(w, l), max(w, l))
+            key = (t, r, area, perimeter, num_holes, min(w, l), max(w, l))
         else:
-            key = (w, l)
+            key = (t, r, area, perimeter, num_holes, w, l)
 
         if key in grouped:
             grouped[key].quantity += part.quantity
@@ -308,10 +607,15 @@ def group_parts_by_dimensions(parts: List[PartItem]) -> List[PartItem]:
             grouped[key] = PartItem(
                 part_id=part.part_id,
                 name=part.name,
-                dimensions=PartDimension(
-                    width=key[0] if part.allow_rotation else w,
-                    length=key[1] if part.allow_rotation else l,
+                thickness=part.thickness,
+                radius=part.radius,
+                contour=part.contour,
+                holes=part.holes,
+                bounding_box=BoundingBox(
+                    width=key[5] if part.allow_rotation else w,
+                    length=key[6] if part.allow_rotation else l,
                 ),
+                svg_path=part.svg_path,
                 quantity=part.quantity,
                 allow_rotation=part.allow_rotation,
             )
@@ -322,8 +626,8 @@ def group_parts_by_dimensions(parts: List[PartItem]) -> List[PartItem]:
 @router.post(
     "/extract",
     response_model=List[PartItem],
-    summary="Extract flat 2D bounding box dimensions from CAD file",
-    description="Extracts 2D dimensions from .dwg, .dxf, .stl, or .obj files and groups identical parts."
+    summary="Extract True-Shape 2D contours, curves, and thickness from CAD file",
+    description="Extracts all surface angle 2D contours, curved feature radii, material thickness, and inner holes from .dwg, .dxf, .stl, or .obj files."
 )
 @router.post(
     "",
@@ -332,11 +636,12 @@ def group_parts_by_dimensions(parts: List[PartItem]) -> List[PartItem]:
 )
 async def extract_cad_dimensions(
     file: UploadFile = File(...),
-    skip_insert: bool = False
+    default_thickness: float = 0.0
 ) -> List[PartItem]:
     """
-    Upload a CAD file (.dwg, .dxf, .stl, .obj) to extract flat 2D bounding box dimensions.
-    Returns a compressed JSON list of PartItem objects with merged quantities.
+    Upload a CAD file (.dwg, .dxf, .stl, .obj) to perform multi-angle True-Shape Extraction.
+    Returns a compressed JSON list of PartItem objects with true 2D contours, inner holes,
+    calculated radii, material thickness, SVG strings, and merged quantities.
     """
     filename = file.filename or ""
     file_ext = Path(filename).suffix.lower()
@@ -366,14 +671,14 @@ async def extract_cad_dimensions(
         extracted_parts: List[PartItem] = []
 
         if file_ext in {".stl", ".obj"}:
-            extracted_parts = extract_3d_dimensions(temp_file_path, file_stem)
+            extracted_parts = extract_3d_true_shapes(temp_file_path, file_stem)
         elif file_ext == ".dxf":
-            extracted_parts = extract_dxf_dimensions(temp_file_path, file_stem, skip_insert=skip_insert)
+            extracted_parts = extract_dxf_true_shapes(temp_file_path, file_stem, default_thickness=default_thickness)
         elif file_ext == ".dwg":
             conversion_dir = temp_dir / "converted_dxf"
             try:
                 converted_dxf_path = convert_dwg_to_dxf(temp_file_path, conversion_dir)
-                extracted_parts = extract_dxf_dimensions(converted_dxf_path, file_stem, skip_insert=skip_insert)
+                extracted_parts = extract_dxf_true_shapes(converted_dxf_path, file_stem, default_thickness=default_thickness)
             except FileNotFoundError as fnf_err:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -385,37 +690,31 @@ async def extract_cad_dimensions(
                     detail=str(rt_err)
                 )
 
-        # Optimize payload by grouping parts with identical dimensions before returning
-        return group_parts_by_dimensions(extracted_parts)
+        return group_true_shape_parts(extracted_parts)
 
 
 if __name__ == "__main__":
     import uvicorn
     from fastapi import FastAPI
 
-    # Ensure parent directory is in sys.path so schemas.py in the parent directory imports correctly
     parent_dir = Path(__file__).resolve().parent.parent
     if str(parent_dir) not in sys.path:
         sys.path.append(str(parent_dir))
 
-    # Temporary FastAPI instance for testing
     app = FastAPI(
-        title="CAD Dimension Extraction Service",
-        description="Local test server for CAD 2D bounding box extraction router.",
-        version="1.0.0",
+        title="CAD True-Shape & Curve Extraction Service",
+        description="Local server for multi-angle CAD True-Shape & curve extraction router.",
+        version="3.0.0",
     )
 
-    # Include the CAD router
     app.include_router(router)
 
-    # Root health-check endpoint
     @app.get("/", tags=["Health"])
     async def health_check():
         return {
             "status": "healthy",
-            "service": "cad-extractor",
+            "service": "cad-true-shape-curve-extractor",
             "docs_url": "/docs"
         }
 
-    # Run via uvicorn on port 8000
     uvicorn.run(app, host="0.0.0.0", port=8000)
